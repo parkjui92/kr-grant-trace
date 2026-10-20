@@ -255,7 +255,12 @@ WORK_FIELDS = ("id,doi,title,publication_year,type,cited_by_count,fwci,open_acce
 
 
 def _api_key() -> str:
-    return os.environ.get("OPENALEX_API_KEY", "")
+    k = os.environ.get("OPENALEX_API_KEY", "").strip()
+    if not k:
+        f = Path.home() / ".kr-grant-trace" / "key"
+        if f.exists():
+            k = f.read_text(encoding="utf-8").strip()
+    return k
 
 
 def _works_page(filter_expr: str, select: str, cursor: str | None = None, extra: dict | None = None) -> dict:

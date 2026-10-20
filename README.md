@@ -52,7 +52,7 @@ OpenAlex는 표기마다 별도 award 엔티티를 만들기 때문에 정규화
 2026-10부터 OpenAlex는 2쪽 이상 페이징에 무료 키를 요구합니다. 키 없이도 돌아가도록 **과제 1건씩·연도별로 쪼개** 200건 이하 구간만 받습니다(요청 수가 늘고, 한 연도 200건 초과분은 잘림). 많이 돌리려면 키를 받아 환경변수로 주세요.
 
 ```bash
-export OPENALEX_API_KEY=...        # https://openalex.org/settings/api (무료)
+export OPENALEX_API_KEY=...        # 또는 ~/.kr-grant-trace/key 파일 (https://openalex.org/settings/api, 무료)
 export OPENALEX_MAILTO=you@example.org
 export KR_GRANT_TRACE_DB=~/.kr-grant-trace/cache.db   # 기본값
 ```
