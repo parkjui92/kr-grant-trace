@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
@@ -30,8 +31,9 @@ from dataclasses import dataclass, field, asdict
 from datetime import date
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 API = "https://api.openalex.org"
+PAGE_SIZE = 100  # supported list-page limit; grouped responses still allow 200
 
 # OpenAlex 한국 펀더 ID(2026-10-20 조회). 숫자만인 번호는 이 목록으로 범위를 좁힌다.
 KR_FUNDERS = {
@@ -211,7 +213,15 @@ def _mailto() -> str:
     return os.environ.get("OPENALEX_MAILTO", "")
 
 
+class OpenAlexHTTPError(RuntimeError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"OpenAlex HTTP {status}")
+
+
 def http_get_json(url: str, retries: int = 3) -> dict:
+    if _api_key() and "api_key=" not in url:
+        url += ("&" if "?" in url else "?") + "api_key=" + urllib.parse.quote(_api_key())
     if _mailto() and "mailto=" not in url:
         url += ("&" if "?" in url else "?") + "mailto=" + urllib.parse.quote(_mailto())
     last = None
@@ -222,10 +232,18 @@ def http_get_json(url: str, retries: int = 3) -> dict:
                 if body is None:
                     continue
                 return json.loads(body)
+            except (urllib.error.HTTPError, OpenAlexHTTPError) as e:
+                status = e.code if isinstance(e, urllib.error.HTTPError) else e.status
+                last = OpenAlexHTTPError(status)
+                if status not in (429, 500, 502, 503, 504):
+                    raise last from None
+                break
             except Exception as e:          # noqa: BLE001
                 last = e
         time.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(f"OpenAlex 요청 실패: {url[:120]}… ({last.__class__.__name__}: {last})")
+    if isinstance(last, OpenAlexHTTPError):
+        raise last
+    raise RuntimeError(f"OpenAlex 요청 실패 ({last.__class__.__name__}) — 연결·인증서 확인 후 재시도")
 
 
 def _get_urllib(url, ctx=None):
@@ -243,11 +261,14 @@ def _get_certifi(url):
 
 
 def _get_curl(url):
-    p = subprocess.run(["curl", "-sS", "--max-time", "60", "-A", f"kr-grant-trace/{__version__}", url],
-                       capture_output=True, text=True)
+    p = subprocess.run(["curl", "-sS", "--max-time", "60", "-w", "\n%{http_code}",
+                        "-A", f"kr-grant-trace/{__version__}", url], capture_output=True, text=True)
     if p.returncode != 0:
-        raise RuntimeError(p.stderr.strip()[:200])
-    return p.stdout
+        raise RuntimeError("curl 연결 실패")
+    body, status = p.stdout.rsplit("\n", 1)
+    if int(status) >= 400:
+        raise OpenAlexHTTPError(int(status))
+    return body
 
 
 WORK_FIELDS = ("id,doi,title,publication_year,type,cited_by_count,fwci,open_access,"
@@ -264,7 +285,7 @@ def _api_key() -> str:
 
 
 def _works_page(filter_expr: str, select: str, cursor: str | None = None, extra: dict | None = None) -> dict:
-    params = {"filter": filter_expr, "per_page": 200, "select": select}
+    params = {"filter": filter_expr, "per_page": PAGE_SIZE, "select": select}
     if cursor:
         params["cursor"] = cursor
     if _api_key():
@@ -275,20 +296,20 @@ def _works_page(filter_expr: str, select: str, cursor: str | None = None, extra:
 
 
 class Truncated(Exception):
-    """키 없이 200건을 넘는 구간 — 받은 만큼만 돌려주고 잘렸다고 알린다."""
+    """키 없이 100건을 넘는 구간 — 받은 만큼만 돌려주고 잘렸다고 알린다."""
 
 
 def iter_works(filter_expr: str, select: str = WORK_FIELDS, max_pages: int = 500, truncated: list | None = None):
     """OpenAlex works를 전부 돈다.
 
     - API 키(OPENALEX_API_KEY)가 있으면 cursor 페이징
-    - 키가 없으면 cursor 2쪽부터 거부되므로(2026-10 변경) 연도별로 쪼개 200건 이하 구간만 받는다.
-      한 연도가 200건을 넘으면 받은 만큼만 내고 `truncated`에 (filter, year, count)를 적는다.
+    - 키가 없으면 cursor 2쪽부터 거부되므로(2026-10 변경) 연도별로 쪼개 100건 이하 구간만 받는다.
+      한 연도가 100건을 넘으면 받은 만큼만 내고 `truncated`에 (filter, year, count)를 적는다.
     """
     first = _works_page(filter_expr, select, "*")
     total = first.get("meta", {}).get("count", 0)
     yield from first.get("results", [])
-    if total <= 200:
+    if total <= len(first.get("results", [])):
         return
     if _api_key():
         cursor = first["meta"].get("next_cursor")
@@ -298,6 +319,8 @@ def iter_works(filter_expr: str, select: str = WORK_FIELDS, max_pages: int = 500
             yield from d.get("results", [])
             cursor = d.get("meta", {}).get("next_cursor")
             pages += 1
+        if cursor and truncated is not None:
+            truncated.append((filter_expr[:60], "page_limit", total))
         return
     # 키 없음 → 연도 슬라이스. 첫 쪽은 이미 냈으므로 중복은 호출 쪽이 id로 걸러야 한다
     seen = {w["id"] for w in first.get("results", [])}
@@ -315,10 +338,10 @@ def iter_works(filter_expr: str, select: str = WORK_FIELDS, max_pages: int = 500
                 continue
             seen.add(w["id"])
             yield w
-        if cnt > 200:
+        if cnt > got:
             if truncated is not None:
                 truncated.append((filter_expr[:60], y, cnt))
-            print(f"  ! {y}년 구간 {cnt}건 중 200건만 받음 — OPENALEX_API_KEY를 주면 전부 받습니다", file=sys.stderr)
+            print(f"  ! {y}년 구간 {cnt}건 중 {got}건만 받음 — OPENALEX_API_KEY를 주면 전부 받습니다", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +363,9 @@ def open_db(path: str) -> sqlite3.Connection:
       canonical TEXT PRIMARY KEY, scheme TEXT, variants_json TEXT, n_works INT, fetched TEXT);
     CREATE INDEX IF NOT EXISTS ix_matches_work ON matches(work_id);
     """)
+    if "truncations_json" not in {r[1] for r in con.execute("PRAGMA table_info(queries)")}:
+        con.execute("ALTER TABLE queries ADD COLUMN truncations_json TEXT")
+        con.commit()
     return con
 
 
@@ -402,6 +428,8 @@ def _funder_filter() -> str:
 
 
 def trace(args):
+    if args.batch < 1:
+        raise SystemExit("--batch 는 1 이상이어야 합니다")
     ids = _read_ids(args)
     if not ids:
         sys.exit("과제번호를 주세요 (인자 또는 --file)")
@@ -422,6 +450,13 @@ def trace(args):
 
     # 변형 전개 → 묶음 질의. 펀더 필터가 필요한 것은 따로 묶는다
     truncated_all: list = []
+    for n in norms.values():
+        if n not in todo:
+            cached = con.execute("SELECT truncations_json FROM queries WHERE canonical=?", (n.canonical,)).fetchone()
+            if cached and cached[0] is not None:
+                truncated_all.extend(json.loads(cached[0]))
+            else:
+                print(f"! {n.canonical}: 이전 버전 캐시는 수집 완전성 정보가 없음 — --refresh 권장", file=sys.stderr)
     groups = {False: [], True: []}
     for n in todo:
         groups[n.needs_funder_filter].append(n)
@@ -429,8 +464,16 @@ def trace(args):
         print("키 없음 → 연도 슬라이스 경로를 위해 과제 1건씩 질의(--batch 1)", file=sys.stderr)
         args.batch = 1
     for needs_f, bucket in groups.items():
-        for i in range(0, len(bucket), args.batch):
-            chunk = bucket[i:i + args.batch]
+        chunks, chunk, variant_count = [], [], 0
+        for n in bucket:
+            if chunk and (len(chunk) >= args.batch or variant_count + len(n.variants) > 100):
+                chunks.append(chunk)
+                chunk, variant_count = [], 0
+            chunk.append(n)
+            variant_count += len(n.variants)
+        if chunk:
+            chunks.append(chunk)
+        for chunk in chunks:
             variant_to_norm = {}
             for n in chunk:
                 for v in n.variants:
@@ -440,27 +483,31 @@ def trace(args):
                 expr += "," + _funder_filter()
             found = defaultdict(set)
             trunc: list = []
-            for w in iter_works(expr, truncated=trunc):
-                row = _flatten(w)
-                con.execute("INSERT OR REPLACE INTO works VALUES (:id,:doi,:title,:year,:type,:cited_by,:fwci,:is_oa,"
-                            ":oa_status,:intl,:n_countries,:kr_inst,:topic,:field,:awards_json,:retracted,:fetched)", row)
-                for a in w.get("awards") or []:
-                    fid = a.get("funder_award_id") or ""
-                    hit = variant_to_norm.get(fid)
-                    if hit is None:
-                        # 응답의 표기가 우리 변형 목록과 달라도 정규화하면 같은 과제일 수 있다
-                        nn = normalize(fid)
-                        hit = next((n for n in chunk if n.canonical == nn.canonical), None)
-                    if hit:
-                        found[hit.canonical].add(row["id"])
-                        con.execute("INSERT OR IGNORE INTO matches VALUES (?,?,?,?,?)",
-                                    (hit.canonical, hit.scheme, row["id"], fid, run))
-            for n in chunk:
-                con.execute("INSERT OR REPLACE INTO queries VALUES (?,?,?,?,?)",
-                            (n.canonical, n.scheme, json.dumps(n.variants, ensure_ascii=False), len(found[n.canonical]), run))
-            if trunc:
-                truncated_all.extend(trunc)
-            con.commit()
+            with con:
+                for n in chunk:
+                    con.execute("DELETE FROM matches WHERE canonical=?", (n.canonical,))
+                for w in iter_works(expr, truncated=trunc):
+                    row = _flatten(w)
+                    con.execute("INSERT OR REPLACE INTO works VALUES (:id,:doi,:title,:year,:type,:cited_by,:fwci,:is_oa,"
+                                ":oa_status,:intl,:n_countries,:kr_inst,:topic,:field,:awards_json,:retracted,:fetched)", row)
+                    for a in w.get("awards") or []:
+                        fid = a.get("funder_award_id") or ""
+                        hit = variant_to_norm.get(fid)
+                        if hit is None:
+                            # 응답의 표기가 우리 변형 목록과 달라도 정규화하면 같은 과제일 수 있다
+                            nn = normalize(fid)
+                            hit = next((n for n in chunk if n.canonical == nn.canonical), None)
+                        if hit and hit.needs_funder_filter and (a.get("funder_id") or "").rsplit("/", 1)[-1] not in KR_FUNDERS:
+                            hit = None
+                        if hit:
+                            found[hit.canonical].add(row["id"])
+                            con.execute("INSERT OR IGNORE INTO matches VALUES (?,?,?,?,?)",
+                                        (hit.canonical, hit.scheme, row["id"], fid, run))
+                for n in chunk:
+                    con.execute("INSERT OR REPLACE INTO queries VALUES (?,?,?,?,?,?)",
+                                (n.canonical, n.scheme, json.dumps(n.variants, ensure_ascii=False), len(found[n.canonical]), run, json.dumps(trunc)))
+                if trunc:
+                    truncated_all.extend(trunc)
             print(f"  질의 {len(chunk)}개 → 논문 {sum(len(v) for v in found.values())}건", file=sys.stderr)
 
     # 출력
@@ -478,7 +525,7 @@ def trace(args):
     out = Path(args.out) if args.out else None
     if args.format == "json" or (out and out.suffix == ".json"):
         data = {"run": run, "credit_rule": "full (각 과제에 논문 1건씩 — summarize --credit 로 변경)",
-                "unparsed": [asdict(n) for n in unparsed], "rows": [dict(zip(cols, r)) for r in rows]}
+                "truncations": truncated_all, "unparsed": [asdict(n) for n in unparsed], "rows": [dict(zip(cols, r)) for r in rows]}
         text = json.dumps(data, ensure_ascii=False, indent=1)
     else:
         import io
@@ -580,55 +627,55 @@ def summarize(args):
 # ---------------------------------------------------------------------------
 
 def coverage(args):
-    """NTIS 성과 목록(DOI·과제번호)을 OpenAlex 추적 결과와 대조. 매칭률은 하한."""
+    """NTIS 행 전체를 분모로 삼고 미색인·조회 실패·DOI 누락을 구분한다."""
     con = open_db(args.db)
     with Path(args.ntis).open(encoding="utf-8-sig", newline="") as f:
         rd = csv.DictReader(f)
         doi_col = args.doi_column or _guess_col(rd.fieldnames, ("doi",))
         id_col = args.column or _guess_col(rd.fieldnames, ("과제번호", "과제고유번호", "award", "grant"))
-        if not doi_col or not id_col:
-            sys.exit(f"DOI/과제번호 열을 못 찾았습니다: {rd.fieldnames}")
-        ntis = [(r[doi_col].strip().lower().replace("https://doi.org/", ""), r[id_col].strip()) for r in rd if r.get(doi_col)]
+        if doi_col not in (rd.fieldnames or []) or id_col not in (rd.fieldnames or []):
+            raise SystemExit(f"DOI/과제번호 열을 못 찾았습니다: {rd.fieldnames}")
+        ntis = [((r.get(doi_col) or "").strip().lower().replace("https://doi.org/", ""),
+                 (r.get(id_col) or "").strip()) for r in rd]
     total = len(ntis)
-    reasons = Counter()
-    detail = []
+    if not total:
+        raise SystemExit("NTIS 성과 목록이 비어 있어 매칭률을 계산하지 않습니다")
+    reasons, detail = Counter(), []
     for doi, raw in ntis:
         n = normalize(raw)
-        if n.scheme == "UNPARSED":
-            reasons["번호 미해석"] += 1
-            detail.append((doi, raw, "번호 미해석"))
-            continue
-        w = con.execute("SELECT id, awards_json FROM works WHERE doi=?", (doi,)).fetchone()
-        if not w:
-            # 캐시에 없으면 DOI로 한 번 조회(사사 없는 논문인지, 색인 자체가 없는지 가른다)
-            try:
-                d = http_get_json(f"{API}/works/https://doi.org/{urllib.parse.quote(doi)}?select=id,awards")
-                awards = [a.get("funder_award_id") for a in d.get("awards") or []]
-                if not awards:
-                    reasons["OpenAlex에 있으나 사사 정보 없음"] += 1
-                    detail.append((doi, raw, "사사 없음"))
-                else:
-                    norm_awards = {normalize(a).canonical for a in awards if a}
-                    if n.canonical in norm_awards:
-                        reasons["매칭(DOI 조회로)"] += 1
-                        detail.append((doi, raw, "매칭"))
-                    else:
-                        reasons["사사는 있으나 다른 번호"] += 1
-                        detail.append((doi, raw, "다른 번호: " + ", ".join(sorted(a for a in awards if a))[:80]))
-            except RuntimeError:
-                reasons["DOI가 OpenAlex에 없음"] += 1
-                detail.append((doi, raw, "미색인"))
-            continue
-        norm_awards = {normalize(a["id"]).canonical for a in json.loads(w[1]) if a.get("id")}
-        if n.canonical in norm_awards:
-            reasons["매칭"] += 1
-            detail.append((doi, raw, "매칭"))
+        verdict = None
+        awards = []
+        if not doi:
+            verdict = "DOI 누락"
+        elif n.scheme == "UNPARSED":
+            verdict = "번호 미해석"
         else:
-            reasons["사사는 있으나 다른 번호"] += 1
-            detail.append((doi, raw, "다른 번호"))
-    matched = reasons["매칭"] + reasons["매칭(DOI 조회로)"]
-    print(f"# 커버리지 — NTIS 성과 {total}건 중 OpenAlex 사사 매칭 {matched}건 ({matched/total:.1%}) **하한**")
-    print("사사를 쓰지 않은 논문·비색인 학술지는 이 방법으로 영영 못 잡는다. 아래 사유별 건수가 그 크기다.\n")
+            w = con.execute("SELECT awards_json FROM works WHERE doi=?", (doi,)).fetchone()
+            if w:
+                awards = json.loads(w[0])
+            else:
+                try:
+                    d = http_get_json(f"{API}/works/https://doi.org/{urllib.parse.quote(doi)}?select=id,awards")
+                    awards = [{"id": a.get("funder_award_id"), "funder": (a.get("funder_id") or "").rsplit("/", 1)[-1]}
+                              for a in d.get("awards") or []]
+                except OpenAlexHTTPError as e:
+                    verdict = "DOI가 OpenAlex에 없음" if e.status == 404 else "조회 실패(미색인 여부 미확인)"
+                except RuntimeError:
+                    verdict = "조회 실패(미색인 여부 미확인)"
+            if verdict is None:
+                if not awards:
+                    verdict = "OpenAlex에 있으나 사사 정보 없음"
+                elif any(normalize(a["id"]).canonical == n.canonical and
+                         (not n.needs_funder_filter or a.get("funder") in KR_FUNDERS)
+                         for a in awards if a.get("id")):
+                    verdict = "매칭"
+                else:
+                    verdict = "사사는 있으나 다른 번호·펀더"
+        reasons[verdict] += 1
+        detail.append((doi, raw, verdict))
+    matched = reasons["매칭"]
+    print(f"# 커버리지 — NTIS 성과 {total}행 중 OpenAlex 사사 매칭 {matched}행 ({matched/total:.1%}) **하한**")
+    print("분모는 입력 CSV의 모든 데이터 행(DOI 누락 포함, 중복행 자동 제거 안 함). 조회 실패는 미색인으로 단정하지 않습니다.\n")
     print("| 사유 | 건수 |\n|---|---|")
     for k, v in reasons.most_common():
         print(f"| {k} | {v} |")
